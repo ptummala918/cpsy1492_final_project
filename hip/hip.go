@@ -251,6 +251,38 @@ type Sim struct {
 
 	// a list of random seeds to use for each run
 	RandSeeds randx.Seeds `display:"-"`
+
+	// ---- Alzheimer's Disease Progression ----
+
+	// DiseaseStage is the master disease progression variable: 0 = healthy, 1 = severe AD.
+	// Controls weight decay radiating from CA1, CA noise, and tipping point lesion.
+	DiseaseStage float64 `min:"0" max:"1" step:"0.05"`
+
+	// TippingPoint is the DiseaseStage threshold at which neuronal death (unit deletion) begins.
+	TippingPoint float64 `default:"0.65" min:"0" max:"1" step:"0.05"`
+
+	// MaxWtLoss is the maximum proportional weight loss applied to CA3→CA1 at DiseaseStage=1.
+	// Paths further from CA1 receive proportionally less decay.
+	MaxWtLoss float64 `default:"0.6" min:"0" max:"1" step:"0.05"`
+
+	// MaxNoise is the maximum Ge noise variance added to CA layers at DiseaseStage=1.
+	MaxNoise float64 `default:"0.05" min:"0" max:"0.5" step:"0.005"`
+
+	// NMDAProtect simulates NMDA antagonist intervention: halves CA noise and raises
+	// the effective tipping point threshold by 0.15.
+	NMDAProtect bool
+
+	// SweepDisease, when true, automatically sets DiseaseStage = runIdx/(NRuns-1)
+	// at the start of each Run, sweeping the full 0→1 progression across runs.
+	SweepDisease bool
+
+	// DidLesion tracks whether the tipping point unit-deletion lesion has been applied
+	// for the current run.
+	DidLesion bool `display:"-"`
+
+	// OrigWeights stores the initial weights for every projection keyed by
+	// "SendLayer:RecvLayer", used to make weight decay idempotent.
+	OrigWeights map[string][]float32 `display:"-"`
 }
 
 // New creates new blank elements and initializes defaults
@@ -279,6 +311,15 @@ func (ss *Sim) New() {
 	ss.RandSeeds.Init(100) // max 100 runs
 	ss.InitRandSeed(0)
 	ss.Context.Defaults()
+
+	// Disease progression defaults
+	ss.DiseaseStage = 0.0
+	ss.TippingPoint = 0.65
+	ss.MaxWtLoss = 0.6
+	ss.MaxNoise = 0.05
+	ss.NMDAProtect = false
+	ss.SweepDisease = false
+	ss.DidLesion = false
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -387,11 +428,148 @@ func (ss *Sim) ConfigNet(net *leabra.Network) {
 	ss.ApplyParams()
 	net.InitWeights()
 	net.InitTopoScales()
+	ss.SaveOriginalWeights() // must come after InitWeights; baseline for disease decay
 }
 
 func (ss *Sim) ApplyParams() {
 	ss.Params.Network = ss.Net
 	ss.Params.SetAll()
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////
+// 		Alzheimer's Disease Progression
+
+// pathDecayFactors maps each projection (identified by "SendName:RecvName") to a
+// fraction of MaxWtLoss applied at DiseaseStage=1.  Damage radiates outward from
+// CA1 — the first hippocampal region affected in Alzheimer's disease.
+var pathDecayFactors = map[string]float64{
+	"CA3:CA1":    1.0, // Schaffer collaterals — earliest and hardest hit
+	"ECin:CA1":   0.9, // EC→CA1 encoder path
+	"CA1:ECout":  0.9, // CA1→ECout encoder path
+	"ECout:CA1":  0.9, // ECout→CA1 feedback
+	"ECin:CA3":   0.6, // Perforant path to CA3
+	"CA3:CA3":    0.6, // CA3 recurrent collaterals
+	"ECin:DG":    0.3, // Perforant path to DG
+	"DG:CA3":     0.3, // Mossy fibers
+	"ECout:ECin": 0.0, // Cortical relay — largely spared
+	"Input:ECin": 0.0, // Sensory input — spared
+}
+
+// SaveOriginalWeights captures all projection weights immediately after
+// InitWeights so that ApplyGlobalWeightDecay can compute decay relative to the
+// healthy baseline rather than the already-degraded current state.
+// This makes decay idempotent: calling ApplyDiseaseParams at any DiseaseStage
+// value always produces the correct result.
+func (ss *Sim) SaveOriginalWeights() {
+	ss.OrigWeights = make(map[string][]float32)
+	for _, ly := range ss.Net.Layers {
+		for _, pt := range ly.RecvPaths {
+			key := pt.Send.Name + ":" + pt.Recv.Name
+			wts := make([]float32, len(pt.Syns))
+			for j := range pt.Syns {
+				wts[j] = pt.Syns[j].Wt
+			}
+			ss.OrigWeights[key] = wts
+		}
+	}
+}
+
+// ApplyGlobalWeightDecay degrades synaptic weights relative to their healthy
+// baseline using the graded per-path decay factors in pathDecayFactors.
+// The decay is linear in DiseaseStage and idempotent across repeated calls.
+func (ss *Sim) ApplyGlobalWeightDecay() {
+	ds := ss.DiseaseStage
+	if ds <= 0 || ss.OrigWeights == nil {
+		return
+	}
+	for _, ly := range ss.Net.Layers {
+		for _, pt := range ly.RecvPaths {
+			key := pt.Send.Name + ":" + pt.Recv.Name
+			factor, ok := pathDecayFactors[key]
+			if !ok || factor == 0 {
+				continue
+			}
+			origWts, hasOrig := ss.OrigWeights[key]
+			if !hasOrig {
+				continue
+			}
+			decay := ss.MaxWtLoss * factor * ds
+			mult := float32(1.0 - decay)
+			if mult < 0.05 {
+				mult = 0.05
+			}
+			for j := range pt.Syns {
+				pt.Syns[j].Wt = origWts[j] * mult
+			}
+		}
+	}
+}
+
+// ApplyCANoise sets Gaussian per-cycle Ge noise on CA1, CA3, and DG to model
+// Aβ-driven glutamate excess and hippocampal hyperactivity.
+// With NMDAProtect enabled the noise is halved, simulating NMDA antagonist treatment.
+func (ss *Sim) ApplyCANoise() {
+	ds := ss.DiseaseStage
+	noiseVar := ss.MaxNoise * ds
+	if ss.NMDAProtect {
+		noiseVar *= 0.5
+	}
+	for _, lnm := range []string{"CA1", "CA3", "DG"} {
+		ly := ss.Net.LayerByName(lnm)
+		if ly == nil {
+			continue
+		}
+		if noiseVar > 0 {
+			ly.Act.Noise.Type = leabra.GeNoise
+			ly.Act.Noise.Fixed = false // per-cycle Gaussian, not fixed alpha
+			ly.Act.Noise.Dist = randx.Gaussian
+			ly.Act.Noise.Var = noiseVar
+			ly.Act.Noise.Mean = 0
+		} else {
+			ly.Act.Noise.Type = leabra.NoNoise
+		}
+	}
+}
+
+// ApplyTippingPointLesion is the one-shot neuronal death event triggered when
+// DiseaseStage crosses TippingPoint.  30% of CA1 neurons and 15% of CA3 neurons
+// are permanently silenced (NeurOff flag), modelling the discrete loss of neurons
+// that produces the abrupt cognitive decline seen in advanced Alzheimer's disease.
+func (ss *Sim) ApplyTippingPointLesion() {
+	lesionLayer := func(ly *leabra.Layer, pct float64) {
+		n := ly.Shape.Len()
+		nLesion := int(float64(n) * pct)
+		perm := rand.Perm(n)
+		for i := 0; i < nLesion; i++ {
+			ly.Neurons[perm[i]].SetFlag(true, leabra.NeurOff)
+		}
+	}
+	ca1 := ss.Net.LayerByName("CA1")
+	ca3 := ss.Net.LayerByName("CA3")
+	if ca1 != nil {
+		lesionLayer(ca1, 0.30)
+	}
+	if ca3 != nil {
+		lesionLayer(ca3, 0.15)
+	}
+	ss.DidLesion = true
+}
+
+// ApplyDiseaseParams applies all Alzheimer's disease effects for the current
+// DiseaseStage: graded weight decay radiating from CA1, CA-layer noise, and
+// (once) the tipping-point neuronal death lesion.
+// Safe to call repeatedly — weight decay and noise are idempotent.
+func (ss *Sim) ApplyDiseaseParams() {
+	ss.ApplyGlobalWeightDecay()
+	ss.ApplyCANoise()
+
+	effectiveTipping := ss.TippingPoint
+	if ss.NMDAProtect {
+		effectiveTipping += 0.15 // antagonist delays catastrophic structural failure
+	}
+	if ss.DiseaseStage >= effectiveTipping && !ss.DidLesion {
+		ss.ApplyTippingPointLesion()
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -542,12 +720,24 @@ func (ss *Sim) ApplyInputs() {
 // for the new run value
 func (ss *Sim) NewRun() {
 	ctx := &ss.Context
-	ss.InitRandSeed(ss.Loops.Loop(etime.Train, etime.Run).Counter.Cur)
+	runIdx := ss.Loops.Loop(etime.Train, etime.Run).Counter.Cur
+	ss.InitRandSeed(runIdx)
 	// ss.ConfigPats()
 	ss.ConfigEnv()
 	ctx.Reset()
 	ctx.Mode = etime.Train
 	ss.Net.InitWeights()
+
+	// Disease progression setup for this run.
+	// If SweepDisease is on, advance DiseaseStage linearly across runs (0→1).
+	ss.DidLesion = false
+	if ss.SweepDisease && ss.Config.NRuns > 1 {
+		ss.DiseaseStage = float64(runIdx) / float64(ss.Config.NRuns-1)
+	}
+	ss.SaveOriginalWeights() // re-snapshot healthy weights for this run
+	ss.ApplyDiseaseParams()
+	ss.Stats.SetFloat("DiseaseStage", ss.DiseaseStage) // keep stat in sync before logging
+
 	ss.InitStats()
 	ss.StatCounters()
 	ss.Logs.ResetLog(etime.Train, etime.Epoch)
@@ -671,6 +861,7 @@ func (ss *Sim) InitStats() {
 	ss.Stats.SetFloat("LureMem", 0.0)
 	ss.Stats.SetFloat("Mem", 0.0)
 	ss.Stats.SetInt("FirstPerfect", -1) // first epoch at when AB Mem is perfect
+	ss.Stats.SetFloat("DiseaseStage", ss.DiseaseStage)
 
 	ss.Logs.InitErrStats() // inits TrlErr, FirstZero, LastZero, NZero
 }
@@ -855,6 +1046,7 @@ func (ss *Sim) ConfigLogs() {
 	ss.Logs.AddStatAggItem("LureMem", etime.Run, etime.Epoch, etime.Trial)
 	ss.Logs.AddStatAggItem("Mem", etime.Run, etime.Epoch, etime.Trial)
 	ss.Logs.AddStatIntNoAggItem(etime.Train, etime.Run, "FirstPerfect")
+	ss.Logs.AddStatFloatNoAggItem(etime.Train, etime.Run, "DiseaseStage")
 
 	// ss.Logs.AddCopyFromFloatItems(etime.Train, etime.Epoch, etime.Test, etime.Epoch, "Tst", "PhaseDiff", "UnitErr", "PctCor", "PctErr", "TrgOnWasOffAll", "TrgOnWasOffCmp", "TrgOffWasOn", "Mem")
 	ss.AddLogItems()
@@ -899,6 +1091,7 @@ func (ss *Sim) ConfigLogs() {
 	ss.Logs.NoPlot(etime.Test, etime.Run)
 	// note: Analyze not plotted by default
 	ss.Logs.SetMeta(etime.Train, etime.Run, "LegendCol", "RunName")
+	ss.Logs.SetMeta(etime.Train, etime.Run, "DiseaseStage:On", "+")
 }
 
 // Log is the main logging function, handles special things for different scopes
@@ -970,6 +1163,20 @@ func (ss *Sim) MakeToolbar(p *tree.Plan) {
 		Func: func() {
 			ss.Logs.ResetLog(etime.Train, etime.Run)
 			ss.GUI.UpdatePlot(etime.Train, etime.Run)
+		},
+	})
+	////////////////////////////////////////////////
+	tree.Add(p, func(w *core.Separator) {})
+	ss.GUI.AddToolbarItem(p, egui.ToolbarItem{Label: "Apply Disease",
+		Icon:    icons.Update,
+		Tooltip: "Apply the current DiseaseStage parameters (weight decay, CA noise, tipping point lesion) to the network immediately. Use after changing DiseaseStage in the sim panel.",
+		Active:  egui.ActiveAlways,
+		Func: func() {
+			ss.DidLesion = false // allow tipping point to re-evaluate
+			ss.SaveOriginalWeights()
+			ss.ApplyDiseaseParams()
+			ss.ViewUpdate.RecordSyns()
+			ss.ViewUpdate.Update()
 		},
 	})
 	////////////////////////////////////////////////
