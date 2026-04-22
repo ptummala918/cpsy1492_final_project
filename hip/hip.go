@@ -253,24 +253,6 @@ type Sim struct {
 	RandSeeds randx.Seeds `display:"-"`
 }
 
-	// global disease progression: 0 = healthy, 1 = severe
-	DiseaseStage float64
-
-	// tipping point for optional structural lesion
-	TippingPoint float64
-
-	// whether lesion has already been applied
-	DidLesion bool
-
-	// max global weakening of weights
-	GlobalWtLoss float64
-
-	// max global noise increase
-	GlobalNoise float64
-
-	// optional intervention flag
-	NMDAProtect bool
-
 // New creates new blank elements and initializes defaults
 func (ss *Sim) New() {
 	// ss.Config.Defaults()
@@ -297,13 +279,6 @@ func (ss *Sim) New() {
 	ss.RandSeeds.Init(100) // max 100 runs
 	ss.InitRandSeed(0)
 	ss.Context.Defaults()
-
-	ss.DiseaseStage = 0.0
-	ss.TippingPoint = 0.65
-	ss.DidLesion = false
-	ss.GlobalWtLoss = 0.6
-	ss.GlobalNoise = 0.05
-	ss.NMDAProtect = false
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -417,76 +392,6 @@ func (ss *Sim) ConfigNet(net *leabra.Network) {
 func (ss *Sim) ApplyParams() {
 	ss.Params.Network = ss.Net
 	ss.Params.SetAll()
-}
-
-func (ss *Sim) ApplyDiseaseParams() {
-	ds := ss.DiseaseStage
-
-	ss.ApplyGlobalWeightDecay(ds)
-	ss.ApplyGlobalNoise(ds)
-
-	if ds >= ss.TippingPoint && !ss.DidLesion {
-		ss.ApplyTippingPointLesion()
-		ss.DidLesion = true
-	}
-}
-
-func (ss *Sim) ApplyGlobalWeightDecay(ds float64) {
-	mult := 1.0 - ss.GlobalWtLoss*ds
-	if mult < 0.1 {
-		mult = 0.1
-	}
-
-	// scale every path in the network
-	for _, lnm := range ss.Net.LayersByType(leabra.InputLayer, leabra.SuperLayer, leabra.TargetLayer) {
-		ly := ss.Net.LayerByName(lnm)
-		if ly == nil {
-			continue
-		}
-
-		for _, p := range ly.RecvPaths {
-			pt := p.AsPath()
-			for i := range pt.Syns {
-				pt.Syns[i].Wt *= float32(mult)
-			}
-		}
-	}
-}
-
-func (ss *Sim) ApplyGlobalNoise(ds float64) {
-	protect := 1.0
-	if ss.NMDAProtect {
-		protect = 0.5
-	}
-	noise := float32(ss.GlobalNoise * ds * protect)
-
-	for _, lnm := range []string{"ECin", "ECout", "DG", "CA3", "CA1"} {
-		ly := ss.Net.LayerByName(lnm)
-		if ly == nil {
-			continue
-		}
-
-		ll := ly.AsLeabra()
-		ll.Act.Noise.On = true
-		ll.Act.Noise.Var = noise
-	}
-}
-
-func (ss *Sim) ApplyTippingPointLesion() {
-	// extra abrupt global decay after the tipping point
-	for _, lnm := range ss.Net.LayersByType(leabra.InputLayer, leabra.SuperLayer, leabra.TargetLayer) {
-		ly := ss.Net.LayerByName(lnm)
-		if ly == nil {
-			continue
-		}
-
-		for _, p := range ly.RecvPaths {
-			pt := p.AsPath()
-			for i := range pt.Syns {
-				pt.Syns[i].Wt *= 0.5
-			}
-		}
-	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -643,10 +548,6 @@ func (ss *Sim) NewRun() {
 	ctx.Reset()
 	ctx.Mode = etime.Train
 	ss.Net.InitWeights()
-
-	ss.DidLesion = false
-	ss.ApplyDiseaseParams()
-
 	ss.InitStats()
 	ss.StatCounters()
 	ss.Logs.ResetLog(etime.Train, etime.Epoch)
@@ -762,7 +663,6 @@ func (ss *Sim) ConfigPats() {
 // called at start of new run
 func (ss *Sim) InitStats() {
 	ss.Stats.SetString("TrialName", "")
-	ss.Stats.SetFloat("DiseaseStage", ss.DiseaseStage)
 	ss.Stats.SetFloat("TrgOnWasOffAll", 0.0)
 	ss.Stats.SetFloat("TrgOnWasOffCmp", 0.0)
 	ss.Stats.SetFloat("TrgOffWasOn", 0.0)
@@ -788,7 +688,6 @@ func (ss *Sim) StatCounters() {
 	ss.Stats.SetInt("Trial", trl)
 	ss.Stats.SetInt("Cycle", int(ctx.Cycle))
 	ss.Stats.SetString("TrialName", ss.Stats.String("TrialName"))
-	ss.Stats.SetFloat("DiseaseStage", ss.DiseaseStage)
 }
 
 func (ss *Sim) NetViewCounters(tm etime.Times) {
@@ -947,7 +846,6 @@ func (ss *Sim) ConfigLogs() {
 	ss.Logs.AddStatIntNoAggItem(etime.AllModes, etime.AllTimes, "Expt")
 	ss.Logs.AddStatStringItem(etime.AllModes, etime.AllTimes, "RunName")
 	ss.Logs.AddStatStringItem(etime.AllModes, etime.Trial, "TrialName")
-	ss.Logs.AddStatAggItem("DiseaseStage", etime.Run, etime.Epoch, etime.Trial)
 
 	ss.Logs.AddStatAggItem("TrgOnWasOffAll", etime.Run, etime.Epoch, etime.Trial)
 	ss.Logs.AddStatAggItem("TrgOnWasOffCmp", etime.Run, etime.Epoch, etime.Trial)
