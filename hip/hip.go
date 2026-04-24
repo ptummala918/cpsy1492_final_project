@@ -272,6 +272,13 @@ type Sim struct {
 	// the effective tipping point threshold by 0.15.
 	NMDAProtect bool
 
+	// NMDALocalOnly reduces noise only in CA layers (more biologically targeted)
+	NMDALocalOnly bool
+
+	// CholinergicBoost simulates cholinesterase inhibitor treatment
+	// by increasing learning/encoding strength in hippocampal and EC pathways.
+	CholinergicBoost bool
+
 	// SweepDisease, when true, automatically sets DiseaseStage = runIdx/(NRuns-1)
 	// at the start of each Run, sweeping the full 0→1 progression across runs.
 	SweepDisease bool
@@ -505,28 +512,67 @@ func (ss *Sim) ApplyGlobalWeightDecay() {
 	}
 }
 
-// ApplyCANoise sets Gaussian per-cycle Ge noise on CA1, CA3, and DG to model
-// Aβ-driven glutamate excess and hippocampal hyperactivity.
-// With NMDAProtect enabled the noise is halved, simulating NMDA antagonist treatment.
-func (ss *Sim) ApplyCANoise() {
+// ApplyNetworkNoise sets Gaussian per-cycle Ge noise across the network to model
+// Aβ-driven hyperactivity and noisier signaling.
+// With NMDAProtect enabled, the added noise is reduced across all non-input layers.
+func (ss *Sim) ApplyNetworkNoise() {
 	ds := ss.DiseaseStage
-	noiseVar := ss.MaxNoise * ds
-	if ss.NMDAProtect {
-		noiseVar *= 0.5
-	}
-	for _, lnm := range []string{"CA1", "CA3", "DG"} {
-		ly := ss.Net.LayerByName(lnm)
-		if ly == nil {
+	baseNoise := ss.MaxNoise * ds
+
+	for _, ly := range ss.Net.Layers {
+
+		if ly.Type == leabra.InputLayer {
 			continue
 		}
+
+		noiseVar := baseNoise
+
+		if ss.NMDAProtect {
+			noiseVar *= 0.5 // global
+		}
+
+		if ss.NMDALocalOnly {
+			if ly.Name == "CA1" || ly.Name == "CA3" || ly.Name == "DG" {
+				noiseVar *= 0.5 // local only
+			}
+		}
+
 		if noiseVar > 0 {
 			ly.Act.Noise.Type = leabra.GeNoise
-			ly.Act.Noise.Fixed = false // per-cycle Gaussian, not fixed alpha
+			ly.Act.Noise.Fixed = false
 			ly.Act.Noise.Dist = randx.Gaussian
 			ly.Act.Noise.Var = noiseVar
 			ly.Act.Noise.Mean = 0
 		} else {
 			ly.Act.Noise.Type = leabra.NoNoise
+		}
+	}
+}
+
+// ApplyCholinergicBoost increases learning rates in key hippocampal pathways
+// to simulate acetylcholine-driven improvements in encoding.
+func (ss *Sim) ApplyCholinergicBoost() {
+	if !ss.CholinergicBoost {
+		return
+	}
+
+	for _, ly := range ss.Net.Layers {
+		for _, pt := range ly.RecvPaths {
+			key := pt.Send.Name + ":" + pt.Recv.Name
+
+			switch key {
+			case "ECin:CA1", "CA1:ECout", "ECout:CA1":
+				pt.Learn.Lrate = 0.06
+
+			case "ECin:DG":
+				pt.Learn.Lrate = 0.5
+
+			case "ECin:CA3":
+				pt.Learn.Lrate = 0.18
+
+			case "CA3:CA1":
+				pt.Learn.Lrate = 0.13
+			}
 		}
 	}
 }
@@ -561,7 +607,8 @@ func (ss *Sim) ApplyTippingPointLesion() {
 // Safe to call repeatedly — weight decay and noise are idempotent.
 func (ss *Sim) ApplyDiseaseParams() {
 	ss.ApplyGlobalWeightDecay()
-	ss.ApplyCANoise()
+	ss.ApplyNetworkNoise()
+	ss.ApplyCholinergicBoost()
 
 	effectiveTipping := ss.TippingPoint
 	if ss.NMDAProtect {
