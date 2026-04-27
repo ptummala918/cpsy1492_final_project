@@ -440,18 +440,21 @@ func (ss *Sim) ApplyParams() {
 // 		Alzheimer's Disease Progression
 
 // pathDecayFactors maps each projection (identified by "SendName:RecvName") to a
-// fraction of MaxWtLoss applied at DiseaseStage=1.  Damage radiates outward from
-// CA1 — the first hippocampal region affected in Alzheimer's disease.
+// fraction of MaxWtLoss applied at DiseaseStage=1.  Ordering follows Braak staging:
+// EC perforant path projections degrade first, internal hippocampal circuits later.
+// pathDecayFactors reflects Braak staging: EC layer II perforant path projections
+// degenerate first (stages I-II), followed by CA1 connections (stages III-IV),
+// then CA3/DG internal circuitry (stages V-VI).
 var pathDecayFactors = map[string]float64{
-	"CA3:CA1":    1.0, // Schaffer collaterals — earliest and hardest hit
-	"ECin:CA1":   0.9, // EC→CA1 encoder path
-	"CA1:ECout":  0.9, // CA1→ECout encoder path
-	"ECout:CA1":  0.9, // ECout→CA1 feedback
-	"ECin:CA3":   0.6, // Perforant path to CA3
-	"CA3:CA3":    0.6, // CA3 recurrent collaterals
-	"ECin:DG":    0.3, // Perforant path to DG
-	"DG:CA3":     0.3, // Mossy fibers
-	"ECout:ECin": 0.0, // Cortical relay — largely spared
+	"ECin:DG":    1.0, // Perforant path to DG — EC layer II dies first (Braak I-II)
+	"ECin:CA3":   1.0, // Perforant path to CA3 — same EC layer II origin (Braak I-II)
+	"ECin:CA1":   0.9, // EC layer III → CA1 direct path (Braak I-II, slightly later)
+	"ECout:CA1":  0.9, // ECout→CA1 feedback (Braak I-II, slightly later)
+	"CA3:CA1":    0.6, // Schaffer collaterals — affected after EC (Braak III-IV)
+	"CA3:CA3":    0.6, // CA3 recurrent collaterals (Braak III-IV)
+	"DG:CA3":     0.3, // Mossy fibers — DG relatively spared until late (Braak V-VI)
+	"CA1:ECout":  0.3, // CA1 output path — late stage (Braak V-VI)
+	"ECout:ECin": 0.0, // Cortical relay — spared in hippocampal cascade
 	"Input:ECin": 0.0, // Sensory input — spared
 }
 
