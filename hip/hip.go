@@ -283,6 +283,12 @@ type Sim struct {
 	// at the start of each Run, sweeping the full 0→1 progression across runs.
 	SweepDisease bool
 
+	// BaseNeuronFraction is the proportion of neurons present at the start of each run,
+	// modeling age-related baseline neuron loss. 1.0 = all neurons present (young),
+	// lower values silence a random fraction of neurons in every non-input layer before
+	// disease effects are applied.
+	BaseNeuronFraction float64 `default:"1" min:"0" max:"1" step:"0.05"`
+
 	// DidLesion tracks whether the tipping point unit-deletion lesion has been applied
 	// for the current run.
 	DidLesion bool `display:"-"`
@@ -319,7 +325,8 @@ func (ss *Sim) New() {
 	ss.InitRandSeed(0)
 	ss.Context.Defaults()
 
-	// Disease progression defaults
+	// Age and disease progression defaults
+	ss.BaseNeuronFraction = 1.0
 	ss.DiseaseStage = 0.0
 	ss.TippingPoint = 0.65
 	ss.MaxWtLoss = 0.6
@@ -480,6 +487,28 @@ func (ss *Sim) SaveOriginalWeights() {
 				wts[j] = pt.Syns[j].Wt
 			}
 			ss.OrigWeights[key] = wts
+		}
+	}
+}
+
+// ApplyAgeBaseline silences (1 - BaseNeuronFraction) of neurons uniformly across
+// all non-input layers, modeling age-related neuron loss at the start of a run.
+// Must be called after InitWeights and before SaveOriginalWeights so that weight
+// decay is computed relative to the already-aged baseline.
+func (ss *Sim) ApplyAgeBaseline() {
+	if ss.BaseNeuronFraction >= 1.0 {
+		return
+	}
+	lossPct := 1.0 - ss.BaseNeuronFraction
+	for _, ly := range ss.Net.Layers {
+		if ly.Type == leabra.InputLayer {
+			continue
+		}
+		n := ly.Shape.Len()
+		nLesion := int(float64(n) * lossPct)
+		perm := rand.Perm(n)
+		for i := range nLesion {
+			ly.Neurons[perm[i]].SetFlag(true, leabra.NeurOff)
 		}
 	}
 }
@@ -784,7 +813,8 @@ func (ss *Sim) NewRun() {
 	if ss.SweepDisease && ss.Config.NRuns > 1 {
 		ss.DiseaseStage = float64(runIdx) / float64(ss.Config.NRuns-1)
 	}
-	ss.SaveOriginalWeights() // re-snapshot healthy weights for this run
+	ss.ApplyAgeBaseline()    // age-related neuron loss before snapshotting
+	ss.SaveOriginalWeights() // re-snapshot aged-but-healthy weights for this run
 	ss.ApplyDiseaseParams()
 	ss.Stats.SetFloat("DiseaseStage", ss.DiseaseStage) // keep stat in sync before logging
 
