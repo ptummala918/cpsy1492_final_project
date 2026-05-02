@@ -268,16 +268,25 @@ type Sim struct {
 	// MaxNoise is the maximum Ge noise variance added to CA layers at DiseaseStage=1.
 	MaxNoise float64 `default:"0.05" min:"0" max:"0.5" step:"0.005"`
 
-	// NMDAProtect simulates NMDA antagonist intervention: halves CA noise and raises
-	// the effective tipping point threshold by 0.15.
+	// NMDAProtect simulates NMDA antagonist intervention: reduces Ge noise mean
+	// back toward 0, raises the effective tipping point threshold by 0.15,
+	// and reduces learning rates (plasticity side effect of NMDA blockade).
 	NMDAProtect bool
 
-	// NMDALocalOnly reduces noise only in CA layers (more biologically targeted)
+	// NMDALocalOnly reduces noise only in CA layers (more biologically targeted).
 	NMDALocalOnly bool
 
-	// CholinergicBoost simulates cholinesterase inhibitor treatment
-	// by increasing learning/encoding strength in hippocampal and EC pathways.
+	// NMDALrateScale is the factor by which learning rates are multiplied when
+	// NMDAProtect is active. Default 0.5 — NMDA blockade reduces synaptic plasticity.
+	NMDALrateScale float64 `default:"0.5" min:"0.1" max:"1" step:"0.05"`
+
+	// CholinergicBoost simulates cholinesterase inhibitor treatment (e.g. donepezil):
+	// increases learning rate via ACh-driven LTP enhancement. No effect on noise.
 	CholinergicBoost bool
+
+	// CholinergicLrateScale is the factor by which learning rates are multiplied when
+	// CholinergicBoost is active. Default 1.2 — ACh modestly enhances synaptic plasticity.
+	CholinergicLrateScale float64 `default:"1.2" min:"1" max:"2" step:"0.05"`
 
 	// SweepDisease, when true, automatically sets DiseaseStage = runIdx/(NRuns-1)
 	// at the start of each Run, sweeping the full 0→1 progression across runs.
@@ -332,6 +341,10 @@ func (ss *Sim) New() {
 	ss.MaxWtLoss = 0.6
 	ss.MaxNoise = 0.05
 	ss.NMDAProtect = false
+	ss.NMDALocalOnly = false
+	ss.NMDALrateScale = 0.5
+	ss.CholinergicBoost = false
+	ss.CholinergicLrateScale = 1.2
 	ss.SweepDisease = false
 	ss.DidLesion = false
 }
@@ -545,65 +558,66 @@ func (ss *Sim) ApplyGlobalWeightDecay() {
 }
 
 // ApplyNetworkNoise sets Gaussian per-cycle Ge noise across the network to model
-// Aβ-driven hyperactivity and noisier signaling.
-// With NMDAProtect enabled, the added noise is reduced across all non-input layers.
+// Aβ-driven glutamate excess and hippocampal hyperactivity.
+//
+// Per the beta-amyloid hypothesis, excess Ge shifts the mean excitatory drive
+// upward — neurons fire more than they should. This is modeled by increasing the
+// Gaussian Mean with disease stage rather than the variance, so the whole
+// distribution shifts toward higher Ge values.
+//
+// The NMDA antagonist intervention (NMDAProtect or NMDALocalOnly) pulls the mean
+// back toward 0, modeling reduced glutamate-driven excitotoxicity.
 func (ss *Sim) ApplyNetworkNoise() {
 	ds := ss.DiseaseStage
-	baseNoise := ss.MaxNoise * ds
+
+	// Disease increases the mean Ge — the distribution shifts up, not just spreads.
+	// Variance is kept small and fixed to represent trial-to-trial biological jitter.
+	baseMean := ss.MaxNoise * ds
+	baseVar := ss.MaxNoise * 0.2 // variance is 20% of max, constant across disease stages
 
 	for _, ly := range ss.Net.Layers {
-
 		if ly.Type == leabra.InputLayer {
 			continue
 		}
 
-		noiseVar := baseNoise
+		noiseMean := baseMean
 
+		// NMDA antagonist reduces the mean back toward 0 — less glutamate-driven
+		// excess excitation. Applied globally or only to CA layers depending on flag.
+		isCALayer := ly.Name == "CA1" || ly.Name == "CA3" || ly.Name == "DG"
 		if ss.NMDAProtect {
-			noiseVar *= 0.5 // global
+			noiseMean *= 0.5 // global reduction across all hippocampal layers
+		} else if ss.NMDALocalOnly && isCALayer {
+			noiseMean *= 0.5 // targeted reduction only in CA layers
 		}
 
-		if ss.NMDALocalOnly {
-			if ly.Name == "CA1" || ly.Name == "CA3" || ly.Name == "DG" {
-				noiseVar *= 0.5 // local only
-			}
-		}
-
-		if noiseVar > 0 {
+		if noiseMean > 0 {
 			ly.Act.Noise.Type = leabra.GeNoise
 			ly.Act.Noise.Fixed = false
 			ly.Act.Noise.Dist = randx.Gaussian
-			ly.Act.Noise.Var = noiseVar
-			ly.Act.Noise.Mean = 0
+			ly.Act.Noise.Mean = noiseMean
+			ly.Act.Noise.Var = baseVar
 		} else {
 			ly.Act.Noise.Type = leabra.NoNoise
+			ly.Act.Noise.Mean = 0
+			ly.Act.Noise.Var = 0
 		}
 	}
 }
 
-// ApplyCholinergicBoost increases learning rates in key hippocampal pathways
-// to simulate acetylcholine-driven improvements in encoding.
+// ApplyCholinergicBoost simulates cholinesterase inhibitor treatment (e.g. donepezil).
+// By preventing ACh breakdown, these drugs increase hippocampal acetylcholine levels,
+// which enhances synaptic plasticity and promotes LTP during encoding.
+// This is modeled purely as a learning rate increase — no effect on noise.
 func (ss *Sim) ApplyCholinergicBoost() {
 	if !ss.CholinergicBoost {
 		return
 	}
-
+	scale := float32(ss.CholinergicLrateScale)
 	for _, ly := range ss.Net.Layers {
 		for _, pt := range ly.RecvPaths {
-			key := pt.Send.Name + ":" + pt.Recv.Name
-
-			switch key {
-			case "ECin:CA1", "CA1:ECout", "ECout:CA1":
-				pt.Learn.Lrate = 0.06
-
-			case "ECin:DG":
-				pt.Learn.Lrate = 0.5
-
-			case "ECin:CA3":
-				pt.Learn.Lrate = 0.18
-
-			case "CA3:CA1":
-				pt.Learn.Lrate = 0.13
+			if pt.Learn.Learn {
+				pt.Learn.Lrate *= scale
 			}
 		}
 	}
@@ -633,13 +647,31 @@ func (ss *Sim) ApplyTippingPointLesion() {
 	ss.DidLesion = true
 }
 
+// ApplyNMDALrateReduction scales down learning rates on all plastic pathways when
+// NMDAProtect is active. NMDA receptors are required for LTP — blocking them
+// reduces excitotoxicity but also reduces synaptic plasticity as a side effect.
+func (ss *Sim) ApplyNMDALrateReduction() {
+	if !ss.NMDAProtect {
+		return
+	}
+	scale := float32(ss.NMDALrateScale)
+	for _, ly := range ss.Net.Layers {
+		for _, pt := range ly.RecvPaths {
+			if pt.Learn.Learn {
+				pt.Learn.Lrate *= scale
+			}
+		}
+	}
+}
+
 // ApplyDiseaseParams applies all Alzheimer's disease effects for the current
-// DiseaseStage: graded weight decay radiating from CA1, CA-layer noise, and
-// (once) the tipping-point neuronal death lesion.
-// Safe to call repeatedly — weight decay and noise are idempotent.
+// DiseaseStage: graded weight decay following Braak staging, Ge noise with
+// elevated mean, NMDA lrate reduction, and (once) the tipping-point neuronal
+// death lesion. Safe to call repeatedly — weight decay and noise are idempotent.
 func (ss *Sim) ApplyDiseaseParams() {
 	ss.ApplyGlobalWeightDecay()
 	ss.ApplyNetworkNoise()
+	ss.ApplyNMDALrateReduction()
 	ss.ApplyCholinergicBoost()
 
 	effectiveTipping := ss.TippingPoint
