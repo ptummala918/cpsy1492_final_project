@@ -277,8 +277,13 @@ type Sim struct {
 	NMDALocalOnly bool
 
 	// NMDALrateScale is the factor by which learning rates are multiplied when
-	// NMDAProtect is active. Default 0.5 — NMDA blockade reduces synaptic plasticity.
-	NMDALrateScale float64 `default:"0.5" min:"0.1" max:"1" step:"0.05"`
+	// NMDAProtect is active. Default 0.85 — NMDA blockade reduces synaptic plasticity by 15%.
+	NMDALrateScale float64 `default:"0.85" min:"0.1" max:"1" step:"0.05"`
+
+	// NMDALocalLrateScale is the factor by which learning rates are multiplied when
+	// NMDALocalOnly is active. Default 0.925 — targeted CA-layer blockade has a milder
+	// plasticity cost (7.5% reduction) than full NMDA antagonism.
+	NMDALocalLrateScale float64 `default:"0.925" min:"0.1" max:"1" step:"0.05"`
 
 	// CholinergicBoost simulates cholinesterase inhibitor treatment (e.g. donepezil):
 	// increases learning rate via ACh-driven LTP enhancement. No effect on noise.
@@ -342,7 +347,8 @@ func (ss *Sim) New() {
 	ss.MaxNoise = 0.05
 	ss.NMDAProtect = false
 	ss.NMDALocalOnly = false
-	ss.NMDALrateScale = 0.5
+	ss.NMDALrateScale = 0.85
+	ss.NMDALocalLrateScale = 0.925
 	ss.CholinergicBoost = false
 	ss.CholinergicLrateScale = 1.2
 	ss.SweepDisease = false
@@ -589,6 +595,8 @@ func (ss *Sim) ApplyNetworkNoise() {
 			noiseMean *= 0.5 // global reduction across all hippocampal layers
 		} else if ss.NMDALocalOnly && isCALayer {
 			noiseMean *= 0.5 // targeted reduction only in CA layers
+		} else if ss.CholinergicBoost {
+			noiseMean *= 0.8 // ACh suppresses background excitation (20% reduction)
 		}
 
 		if noiseMean > 0 {
@@ -607,8 +615,8 @@ func (ss *Sim) ApplyNetworkNoise() {
 
 // ApplyCholinergicBoost simulates cholinesterase inhibitor treatment (e.g. donepezil).
 // By preventing ACh breakdown, these drugs increase hippocampal acetylcholine levels,
-// which enhances synaptic plasticity and promotes LTP during encoding.
-// This is modeled purely as a learning rate increase — no effect on noise.
+// which enhances synaptic plasticity (learning rate boost) and suppresses background
+// recurrent excitation via muscarinic receptors (modest noise reduction, handled in ApplyNetworkNoise).
 func (ss *Sim) ApplyCholinergicBoost() {
 	if !ss.CholinergicBoost {
 		return
@@ -651,10 +659,14 @@ func (ss *Sim) ApplyTippingPointLesion() {
 // NMDAProtect is active. NMDA receptors are required for LTP — blocking them
 // reduces excitotoxicity but also reduces synaptic plasticity as a side effect.
 func (ss *Sim) ApplyNMDALrateReduction() {
-	if !ss.NMDAProtect {
+	var scale float32
+	if ss.NMDAProtect {
+		scale = float32(ss.NMDALrateScale) // 0.85 → 15% reduction
+	} else if ss.NMDALocalOnly {
+		scale = float32(ss.NMDALocalLrateScale) // 0.925 → 7.5% reduction
+	} else {
 		return
 	}
-	scale := float32(ss.NMDALrateScale)
 	for _, ly := range ss.Net.Layers {
 		for _, pt := range ly.RecvPaths {
 			if pt.Learn.Learn {
@@ -677,6 +689,9 @@ func (ss *Sim) ApplyDiseaseParams() {
 	effectiveTipping := ss.TippingPoint
 	if ss.NMDAProtect {
 		effectiveTipping += 0.15 // antagonist delays catastrophic structural failure
+	}
+	if ss.NMDALocalOnly {
+		effectiveTipping += 0.075 // targeted CA blockade provides partial structural protection
 	}
 	if ss.DiseaseStage >= effectiveTipping && !ss.DidLesion {
 		ss.ApplyTippingPointLesion()
